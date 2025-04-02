@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	batchinformers "k8s.io/client-go/informers/batch/v1"
@@ -120,7 +122,8 @@ func (c *JobController) processNextWorkItem() bool {
 	if err := c.syncHandler(key); err != nil {
 		// 項目を再キューに入れる
 		c.workqueue.AddRateLimited(key)
-		return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error()) != nil
+		runtime.HandleError(fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error()))
+		return true
 	}
 
 	// 項目の処理が成功した場合、キャッシュから削除
@@ -162,31 +165,69 @@ func (c *JobController) syncHandler(key string) error {
 	job, err := c.jobLister.Jobs(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// 削除されたJobs（バキュームによって）に対してはスキップ
-			runtime.HandleError(fmt.Errorf("job '%s' in work queue no longer exists", key))
-			return nil
-		}
-		return err
+				// ジョブが見つからない場合は、kubeclientを使用して最後の状態を取得しようとする
+				klog.V(2).Infof("Job '%s' not found in cache, trying to get from API", key)
+				job, err = c.kubeclientset.BatchV1().Jobs(namespace).Get(context.Background(), name, metav1.GetOptions{})
+				if err != nil {
+					if errors.IsNotFound(err) {
+						// ジョブが完全に削除された場合は通知の必要なし
+						klog.V(2).Infof("Job '%s' completely deleted, skipping notification", key)
+						c.workqueue.Forget(key) // キューから削除
+						return nil
+					}
+					// その他のAPIエラーは返す
+					return err
+				}
+				// ジョブが見つかった場合、処理を続行
+			} else {
+				// その他のエラーは返す
+				return err
+			}
 	}
+
+	// ログに詳細なジョブ状態を出力
+	klog.V(3).Infof("Processing job '%s/%s', status: completed=%v, failed=%v, active=%d, succeeded=%d, failed=%d",
+		job.Namespace, job.Name, isJobCompleted(job), isJobFailed(job),
+		job.Status.Active, job.Status.Succeeded, job.Status.Failed)
 
 	// Jobのステータスをチェックして通知を送信
 	var notified bool
 	if isJobCompleted(job) {
+		klog.V(2).Infof("Job '%s/%s' is completed, sending notification", job.Namespace, job.Name)
 		if err = c.sendJobCompletedNotification(job); err != nil {
-			return err
+			return fmt.Errorf("failed to send completion notification: %w", err)
 		}
 		notified = true
 	} else if isJobFailed(job) {
+		klog.V(2).Infof("Job '%s/%s' is failed, sending notification", job.Namespace, job.Name)
 		if err = c.sendJobFailedNotification(job); err != nil {
-			return err
+			return fmt.Errorf("failed to send failure notification: %w", err)
 		}
 		notified = true
+	} else {
+		// ジョブはまだ進行中か、完了/失敗の条件がセットされていない
+		// 追加のチェック: Kubernetes JobコントローラがConditionsをセットしない場合がある
+		if job.Status.Failed > 0 && job.Status.Active == 0 {
+			klog.V(2).Infof("Job '%s/%s' has failures and no active pods, sending failure notification", job.Namespace, job.Name)
+			if err = c.sendJobFailedNotification(job); err != nil {
+				return fmt.Errorf("failed to send failure notification: %w", err)
+			}
+			notified = true
+		} else if job.Status.Succeeded > 0 && job.Status.Active == 0 {
+			klog.V(2).Infof("Job '%s/%s' has succeeded pods and no active pods, sending completion notification", job.Namespace, job.Name)
+			if err = c.sendJobCompletedNotification(job); err != nil {
+				return fmt.Errorf("failed to send completion notification: %w", err)
+			}
+			notified = true
+		}
 	}
 
 	// 通知を送信した場合は通知済みとしてマーク
 	if notified {
 		c.markJobNotified(key)
 		klog.Infof("Sent notification for job '%s'", key)
+	} else {
+		klog.V(4).Infof("Job '%s/%s' is not completed or failed yet, skipping notification", job.Namespace, job.Name)
 	}
 
 	return nil
