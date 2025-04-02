@@ -20,10 +20,14 @@ func main() {
 	var kubeconfig string
 	var masterURL string
 	var webhookURL string
+	var jobNameFilter string
+	var includeMatches bool
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&webhookURL, "webhook-url", "", "URL to send webhook notifications")
+	flag.StringVar(&jobNameFilter, "job-name-filter", "", "Regular expression pattern to filter jobs by name")
+	flag.BoolVar(&includeMatches, "include-matches", true, "If true, include jobs matching the filter pattern; if false, exclude them")
 	flag.Parse()
 
 	if webhookURL == "" {
@@ -59,11 +63,16 @@ func main() {
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, time.Second*30)
 
 	// Jobコントローラーを初期化
-	jobController := controller.NewJobController(
+	jobController, err := controller.NewJobController(
 		kubeClient,
 		informerFactory.Batch().V1().Jobs(),
 		webhookURL,
+		jobNameFilter,
+		includeMatches,
 	)
+	if err != nil {
+		klog.Fatalf("Error initializing job controller: %s", err.Error())
+	}
 
 	// インフォーマーファクトリーを開始
 	stopCh := SetupSignalHandler()

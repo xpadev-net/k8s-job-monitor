@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
@@ -36,21 +37,46 @@ type JobController struct {
 	// notifiedJobs は通知が既に送信されたJobを追跡します
 	notifiedJobs     map[string]bool
 	notifiedJobsLock sync.RWMutex
+	// startTime はコントローラーの起動時刻です
+	startTime time.Time
+	// jobNameFilterRegexp はジョブ名のフィルタリングに使用する正規表現パターンです
+	jobNameFilterRegexp *regexp.Regexp
+	// jobNameFilterInclude はフィルタパターンが含む(true)か除外(false)かを示します
+	jobNameFilterInclude bool
 }
 
 // NewJobController は新しいJobControllerを作成します
 func NewJobController(
 	kubeclientset kubernetes.Interface,
 	jobInformer batchinformers.JobInformer,
-	webhookURL string) *JobController {
+	webhookURL string,
+	jobNameFilter string,
+	includeMatches bool) (*JobController, error) {
+
+	var jobNameFilterRegexp *regexp.Regexp
+	var err error
+	
+	if jobNameFilter != "" {
+		// 正規表現パターンをコンパイル
+		jobNameFilterRegexp, err = regexp.Compile(jobNameFilter)
+		if err != nil {
+			return nil, fmt.Errorf("invalid job name filter pattern: %w", err)
+		}
+		klog.Infof("Using job name filter: %s (include matches: %v)", jobNameFilter, includeMatches)
+	} else {
+		klog.Info("No job name filter specified, will process all jobs")
+	}
 
 	controller := &JobController{
-		kubeclientset: kubeclientset,
-		jobLister:     jobInformer.Lister(),
-		jobsSynced:    jobInformer.Informer().HasSynced,
-		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Jobs"),
-		webhook:       webhook.NewWebhookClient(webhookURL),
-		notifiedJobs:  make(map[string]bool),
+		kubeclientset:       kubeclientset,
+		jobLister:           jobInformer.Lister(),
+		jobsSynced:          jobInformer.Informer().HasSynced,
+		workqueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Jobs"),
+		webhook:             webhook.NewWebhookClient(webhookURL),
+		notifiedJobs:        make(map[string]bool),
+		startTime:           time.Now(),
+		jobNameFilterRegexp: jobNameFilterRegexp,
+		jobNameFilterInclude: includeMatches,
 	}
 
 	klog.Info("Setting up event handlers")
@@ -62,7 +88,7 @@ func NewJobController(
 		},
 	})
 
-	return controller
+	return controller, nil
 }
 
 // Run はコントローラーを実行します
@@ -146,6 +172,21 @@ func (c *JobController) markJobNotified(key string) {
 	c.notifiedJobs[key] = true
 }
 
+// shouldNotifyForJob はジョブが通知対象かどうかを判定します
+func (c *JobController) shouldNotifyForJob(job *batchv1.Job) bool {
+	// フィルターが設定されていない場合は、すべてのジョブを通知
+	if c.jobNameFilterRegexp == nil {
+		return true
+	}
+
+	// ジョブ名がパターンにマッチするかチェック
+	matches := c.jobNameFilterRegexp.MatchString(job.Name)
+
+	// includeMatchesがtrueの場合、マッチしたものを含める
+	// falseの場合、マッチしたものを除外
+	return matches == c.jobNameFilterInclude
+}
+
 // syncHandler はJobの現在の状態を取得し、必要に応じてWebhook通知を送信します
 func (c *JobController) syncHandler(key string) error {
 	// キーからnamespaceとnameを取得
@@ -183,6 +224,21 @@ func (c *JobController) syncHandler(key string) error {
 				// その他のエラーは返す
 				return err
 			}
+	}
+
+	// ジョブ名でフィルタリング
+	if !c.shouldNotifyForJob(job) {
+		klog.V(3).Infof("Job '%s/%s' filtered out by name pattern, skipping notification", 
+			job.Namespace, job.Name)
+		c.markJobNotified(key) // フィルタリングされたジョブも通知済みとしてマーク
+		return nil
+	}
+
+	// ジョブがコントローラー起動前に完了した場合はスキップ
+	if c.isJobCompletedBeforeStart(job) {
+		klog.V(2).Infof("Job '%s/%s' completed before controller started, skipping notification", job.Namespace, job.Name)
+		c.markJobNotified(key) // このジョブは通知済みとしてマークしておく（再処理を避けるため）
+		return nil
 	}
 
 	// ログに詳細なジョブ状態を出力
@@ -231,6 +287,35 @@ func (c *JobController) syncHandler(key string) error {
 	}
 
 	return nil
+}
+
+// isJobCompletedBeforeStart はジョブがコントローラー起動前に完了したかを判定します
+func (c *JobController) isJobCompletedBeforeStart(job *batchv1.Job) bool {
+	// 終了時刻を取得
+	var completionTime time.Time
+	
+	// 完了条件から時刻を取得
+	for _, condition := range job.Status.Conditions {
+		if (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed) && 
+		   condition.Status == "True" && 
+		   !condition.LastTransitionTime.IsZero() {
+			completionTime = condition.LastTransitionTime.Time
+			break
+		}
+	}
+	
+	// 条件から終了時刻が取得できない場合、CompletionTimeを確認
+	if completionTime.IsZero() && job.Status.CompletionTime != nil {
+		completionTime = job.Status.CompletionTime.Time
+	}
+	
+	// それでも終了時刻が不明な場合は、コントローラー起動後とみなす
+	if completionTime.IsZero() {
+		return false
+	}
+	
+	// 終了時刻がコントローラー起動時刻より前かどうかを判定
+	return completionTime.Before(c.startTime)
 }
 
 // isJobCompleted はJobが完了したかどうかを判定します
