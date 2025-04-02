@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -30,6 +31,9 @@ type JobController struct {
 	workqueue workqueue.RateLimitingInterface
 	// webhook はWebhook通知クライアントです
 	webhook *webhook.WebhookClient
+	// notifiedJobs は通知が既に送信されたJobを追跡します
+	notifiedJobs     map[string]bool
+	notifiedJobsLock sync.RWMutex
 }
 
 // NewJobController は新しいJobControllerを作成します
@@ -44,6 +48,7 @@ func NewJobController(
 		jobsSynced:    jobInformer.Informer().HasSynced,
 		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Jobs"),
 		webhook:       webhook.NewWebhookClient(webhookURL),
+		notifiedJobs:  make(map[string]bool),
 	}
 
 	klog.Info("Setting up event handlers")
@@ -124,12 +129,32 @@ func (c *JobController) processNextWorkItem() bool {
 	return true
 }
 
+// isJobAlreadyNotified はJobが既に通知されたかどうかを確認します
+func (c *JobController) isJobAlreadyNotified(key string) bool {
+	c.notifiedJobsLock.RLock()
+	defer c.notifiedJobsLock.RUnlock()
+	return c.notifiedJobs[key]
+}
+
+// markJobNotified はJobを通知済みとしてマークします
+func (c *JobController) markJobNotified(key string) {
+	c.notifiedJobsLock.Lock()
+	defer c.notifiedJobsLock.Unlock()
+	c.notifiedJobs[key] = true
+}
+
 // syncHandler はJobの現在の状態を取得し、必要に応じてWebhook通知を送信します
 func (c *JobController) syncHandler(key string) error {
 	// キーからnamespaceとnameを取得
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		return nil
+	}
+
+	// 既に通知済みの場合は何もしない
+	if c.isJobAlreadyNotified(key) {
+		klog.V(4).Infof("Job '%s' has already been notified, skipping", key)
 		return nil
 	}
 
@@ -145,10 +170,23 @@ func (c *JobController) syncHandler(key string) error {
 	}
 
 	// Jobのステータスをチェックして通知を送信
+	var notified bool
 	if isJobCompleted(job) {
-		return c.sendJobCompletedNotification(job)
+		if err = c.sendJobCompletedNotification(job); err != nil {
+			return err
+		}
+		notified = true
 	} else if isJobFailed(job) {
-		return c.sendJobFailedNotification(job)
+		if err = c.sendJobFailedNotification(job); err != nil {
+			return err
+		}
+		notified = true
+	}
+
+	// 通知を送信した場合は通知済みとしてマーク
+	if notified {
+		c.markJobNotified(key)
+		klog.Infof("Sent notification for job '%s'", key)
 	}
 
 	return nil
