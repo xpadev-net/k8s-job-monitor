@@ -133,7 +133,7 @@ func (c *WebhookClient) sendDiscordNotification(notification JobNotification) er
 
 	// レスポンスをチェック
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("Discord webhook returned non-success status: %d", resp.StatusCode)
+		return fmt.Errorf("discord webhook returned non-success status: %d", resp.StatusCode)
 	}
 
 	return nil
