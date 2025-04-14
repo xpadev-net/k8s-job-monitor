@@ -98,6 +98,17 @@ func (c *JobController) Run(workers int, stopCh <-chan struct{}) error {
 
 	// コントローラーの起動ログ
 	klog.Info("Starting Job controller")
+	
+	// フィルター設定の表示
+	if c.jobNameFilterRegexp != nil {
+		if c.jobNameFilterInclude {
+			klog.Info("✅ Job フィルター設定: パターン「" + c.jobNameFilterRegexp.String() + "」に一致するジョブを通知します")
+		} else {
+			klog.Info("❌ Job フィルター設定: パターン「" + c.jobNameFilterRegexp.String() + "」に一致するジョブを除外します")
+		}
+	} else {
+		klog.Info("📣 Job フィルター: 設定なし（すべてのジョブを通知します）")
+	}
 
 	// インフォーマーのキャッシュが同期されるのを待ちます
 	klog.Info("Waiting for informer caches to sync")
